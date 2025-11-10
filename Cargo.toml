@@ -1,0 +1,10 @@
+[package]
+name = "mc-scanner"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+futures = "0.3.31"
+serde_json = "1.0.145"
+tokio = { version = "1.48.0", features = ["sync", "rt-multi-thread", "macros", "net", "io-util", "fs"] }
+tokio-postgres = "0.7.15"
