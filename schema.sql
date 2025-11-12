@@ -5,6 +5,7 @@ CREATE TABLE servers (
     protocol integer,
     players_max integer,
     players_online integer,
+    online boolean,
     cracked boolean,
     whitelist boolean,
     forge boolean,

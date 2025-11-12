@@ -38,7 +38,6 @@ async fn main() {
     let masscan_output = File::open("masscan/masscan-output.txt").await.expect("file masscan-output.txt was not found, run with --masscan first");
     let mut line_iter = BufReader::new(masscan_output).lines();
 
-    let mut server_count = 0;
     let mut servers: Vec<SocketAddr> = Vec::new();
 
     while let Some(line) = line_iter.next_line().await.unwrap() {
@@ -56,9 +55,9 @@ async fn main() {
         let addr = SocketAddr::new(ip.parse().expect("failed to parse into ipv4 address"), port);
 
         servers.push(addr);
-        server_count += 1;
     }
 
+    let server_count = servers.len();
     println!("scanning {server_count} servers");
     
     let (tx, mut rx) = mpsc::channel(5000);
@@ -97,8 +96,8 @@ async fn main() {
     });
 
     let insert_server = client.prepare(r"
-        INSERT INTO servers (ip, port, version_name, protocol, players_max, players_online, motd, favicon, first_seen, last_seen, cracked, whitelist, forge)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        INSERT INTO servers (ip, port, version_name, protocol, players_max, players_online, online, motd, favicon, first_seen, last_seen, cracked, whitelist, forge)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
         ON CONFLICT (ip, port)
         DO UPDATE SET
             version_name = EXCLUDED.version_name,
@@ -142,6 +141,7 @@ async fn main() {
             &server_info.protocol,
             &server_info.players_max,
             &server_info.players_online,
+            &true,
             &server_info.motd,
             &server_info.favicon,
             &server_info.timestamp,
