@@ -1,99 +1,70 @@
 use std::process::Command;
 use std::env;
-use std::sync::Arc;
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, mpsc, mpsc::Sender};
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
+use tokio::sync::{mpsc, mpsc::Sender};
 use tokio::net::TcpSocket;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::time::timeout;
 use tokio::fs::File;
 use tokio_postgres::NoTls;
 use serde_json::Value;
-use futures::future::join_all;
 
-const BATCH_SIZE: usize = 1000;
-const TIMEOUT: Duration = Duration::from_secs(5);
+struct Config {
+    timeout: Duration,
+    batch_size: usize,
+    join_scan: bool,
+    rescan_mode: bool,
+}
 
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = env::args().collect();
-
-    let mut do_join_scan = false;
-    for arg in args.iter().skip(1) {
-        match arg.as_str() {
-            "-m" | "--masscan" => {
-                println!("scanning for open ports with masscan");
-                Command::new("masscan")
-                    .args(["-c", "masscan/masscan.conf"])
-                    .status().expect("failed to run masscan");
-            },
-            "-j" | "--join" => {
-                do_join_scan = true;
-            },
-            _ => ()
-        }
-    }
-
-    let masscan_output = File::open("masscan/masscan-output.txt").await.expect("file masscan-output.txt was not found, run with --masscan first");
-    let mut line_iter = BufReader::new(masscan_output).lines();
-
-    let mut servers: Vec<SocketAddr> = Vec::new();
-
-    while let Some(line) = line_iter.next_line().await.unwrap() {
-        if line.starts_with('#') {
-            continue
-        }
-
-        let mut split = line.split(' ');
-        split.next();
-        split.next();
-
-        let port: u16 = split.next().expect("wrongly formatted file").parse().expect("wrongly formatted file");
-        let ip: &str = split.next().expect("wrongly formatted file");
-
-        let addr = SocketAddr::new(ip.parse().expect("failed to parse into ipv4 address"), port);
-
-        servers.push(addr);
-    }
-
-    let server_count = servers.len();
-    println!("scanning {server_count} servers");
-    
-    let (tx, mut rx) = mpsc::channel(5000);
-    let scanned = Arc::new(Mutex::new(0));
-    let scanned_clone = scanned.clone();
-
-    tokio::spawn(async move {
-        let mut futures: Vec<_> = Vec::new();
-    
-        for addr in servers {
-            let tx = tx.clone();
-
-            futures.push(scan_server(addr, tx, do_join_scan));
-
-            let futures_len = futures.len();
-            if futures_len >= BATCH_SIZE {
-                join_all(futures).await;
-                *scanned_clone.lock().await += futures_len;
-                futures = Vec::new();
-            }
-        }
-
-        let futures_len = futures.len();
-        if futures_len > 0 {
-            join_all(futures).await;
-            *scanned_clone.lock().await += futures_len;
-        }
-    });
+    let config = parse_args(args);
 
     let (client, connection) = tokio_postgres::connect("host=localhost user=postgres dbname=scanner", NoTls).await.unwrap();
-
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             eprintln!("connection error: {e}");
         }
     });
+
+    let mut servers: Vec<SocketAddr> = Vec::new();
+    if config.rescan_mode {
+        let server_rows = client.query("SELECT ip, port FROM servers", &[]).await.unwrap();
+        for row in server_rows {
+            let ip: IpAddr = row.get("ip");
+            let port: i32 = row.get("port");
+
+            servers.push(SocketAddr::new(ip, port.try_into().unwrap()))
+        }
+    } else {
+        let masscan_output = File::open("masscan/masscan-output.txt").await.expect("file masscan-output.txt was not found, run with --masscan first");
+        let mut line_iter = BufReader::new(masscan_output).lines();
+
+        while let Some(line) = line_iter.next_line().await.unwrap() {
+            if line.starts_with('#') {
+                continue
+            }
+
+            let mut split = line.split(' ');
+            split.next();
+            split.next();
+
+            let port: u16 = split.next().expect("wrongly formatted file").parse().expect("wrongly formatted file");
+            let ip: &str = split.next().expect("wrongly formatted file");
+
+            let addr = SocketAddr::new(ip.parse().expect("failed to parse into ipv4 address"), port);
+
+            servers.push(addr);
+        }
+    }
+
+    let (tx, mut rx) = mpsc::channel(100);
+
+    tokio::spawn(batch_server_list(servers, tx, config));
 
     let insert_server = client.prepare(r"
         INSERT INTO servers (ip, port, version_name, protocol, players_max, players_online, online, motd, favicon, first_seen, last_seen, cracked, whitelist, forge)
@@ -104,6 +75,7 @@ async fn main() {
             protocol = EXCLUDED.protocol,
             players_max = EXCLUDED.players_max,
             players_online = EXCLUDED.players_online,
+            online = EXCLUDED.online,
             motd = EXCLUDED.motd,
             favicon = EXCLUDED.favicon,
             last_seen = EXCLUDED.last_seen,
@@ -119,61 +91,113 @@ async fn main() {
         DO UPDATE SET
             last_seen = EXCLUDED.last_seen
     ").await.unwrap();
-    
-    let mut resp_count = 0;
 
-    while let Some(server) = rx.recv().await {
-        resp_count += 1;
+    let set_offline = client.prepare(r"
+        UPDATE servers
+        SET
+            online = false
+        WHERE
+            ip = $1 AND port = $2 
+    ").await.unwrap();
 
-        let (server_info, server_join_info) = server;
-        
-        let (mut cracked, mut whitelist, mut forge) = (None, None, None);
-        if let Some(server_join_info) = server_join_info {
-            cracked = server_join_info.cracked;
-            whitelist = server_join_info.whitelist;
-            forge = server_join_info.forge;
-        }
+    while let Some(servers) = rx.recv().await {
+        for server in servers {
+            let (addr, server_info, server_join_info) = server;
 
-        if let Err(e) = client.execute(&insert_server, &[
-            &server_info.ip,
-            &server_info.port,
-            &server_info.version_name,
-            &server_info.protocol,
-            &server_info.players_max,
-            &server_info.players_online,
-            &true,
-            &server_info.motd,
-            &server_info.favicon,
-            &server_info.timestamp,
-            &server_info.timestamp,
-            &cracked,
-            &whitelist,
-            &forge,
-        ]).await {
-            println!("error adding server to db: {e}");
-        }
+            let Some(server_info) = server_info else {
+                client.execute(&set_offline, &[&addr.ip(), &(addr.port() as i32)]).await.unwrap();
+                continue
+            };
 
-        if let Some(sample) = server_info.player_sample {
-            for player in sample {
-                if player.name != "Anonymous Player" {
-                    if let Err(e) = client.execute(&insert_player, &[&server_info.ip, &server_info.port, &player.name, &player.uuid, &player.timestamp, &player.timestamp]).await {
-                        println!("error adding player to db: {e}");
+            let (mut cracked, mut whitelist, mut forge) = (None, None, None);
+            if let Some(server_join_info) = server_join_info {
+                cracked = server_join_info.cracked;
+                whitelist = server_join_info.whitelist;
+                forge = server_join_info.forge;
+            }
+
+            if let Err(e) = client.execute(&insert_server, &[
+                &server_info.ip,
+                &server_info.port,
+                &server_info.version_name,
+                &server_info.protocol,
+                &server_info.players_max,
+                &server_info.players_online,
+                &true,
+                &server_info.motd,
+                &server_info.favicon,
+                &server_info.timestamp,
+                &server_info.timestamp,
+                &cracked,
+                &whitelist,
+                &forge,
+            ]).await {
+                eprintln!("error adding server to db: {e}");
+            }
+
+            if let Some(sample) = server_info.player_sample {
+                for player in sample {
+                    if player.name != "Anonymous Player" {
+                        if let Err(e) = client.execute(&insert_player, &[&server_info.ip, &server_info.port, &player.name, &player.uuid, &player.timestamp, &player.timestamp]).await {
+                            eprintln!("error adding player to db: {e}");
+                        }
                     }
                 }
             }
         }
+    }
+}
 
-        let scanned_lock = scanned.lock().await;
+fn parse_args(args: Vec<String>) -> Config {
+    let mut config = Config {
+        timeout: Duration::from_secs(5),
+        batch_size: 1000,
+        join_scan: false,
+        rescan_mode: false,
+    };
 
-        if resp_count % 1000 == 0 {
-            println!("{}/{} scanned, {} servers have responded", *scanned_lock, server_count, resp_count);
+    let mut args_iter = args.iter().skip(1);
+
+    while let Some(arg) = args_iter.next() {
+        match arg.as_str() {
+            "-m" | "--masscan" => {
+                println!("scanning for open ports with masscan");
+                Command::new("masscan")
+                    .args(["-c", "masscan/masscan.conf"])
+                    .status().expect("failed to run masscan");
+            },
+            "-j" | "--join" => {
+                config.join_scan = true;
+            },
+            "-r" | "--rescan" => {
+                println!("rescanning servers in db");
+                config.rescan_mode = true;
+            },
+            "-b" | "--batch-size" => {
+                let size = args_iter.next();
+
+                let Some(size) = size else {
+                    panic!("batch size is not specified")
+                };
+
+                config.batch_size = size.parse().expect("batch size is not a number");
+            },
+            "-t" | "--timeout" => {
+                let timeout = args_iter.next();
+
+                let Some(timeout) = timeout else {
+                    panic!("timeout is not specified")
+                };
+
+                config.timeout = timeout.parse::<humantime::Duration>().expect("timeout is not a valid time").into()
+            },
+            _ => ()
         }
     }
 
-    println!("done, {resp_count}/{server_count} servers responded");
+    config
 }
 
-#[derive(Debug)]
 struct ServerInfo {
     ip: IpAddr,
     port: i32,
@@ -182,12 +206,11 @@ struct ServerInfo {
     players_max: i32,
     players_online: i32,
     player_sample: Option<Vec<Player>>,
-    motd: String,
+    motd: Option<String>,
     favicon: Option<String>,
     timestamp: i64
 }
 
-#[derive(Debug)]
 struct Player {
     name: String,
     uuid: String,
@@ -200,24 +223,51 @@ struct ServerJoinInfo {
     forge: Option<bool>
 }
 
-async fn scan_server(addr: SocketAddr, tx: Sender<(ServerInfo, Option<ServerJoinInfo>)>, do_join_scan: bool) {
-    let Ok(Some(server_info)) = timeout(TIMEOUT, ping_scan(addr)).await else {
-        return
+async fn batch_server_list(server_list: Vec<SocketAddr>, tx: Sender<Vec<(SocketAddr, Option<ServerInfo>, Option<ServerJoinInfo>)>>, config: Config) {
+    let server_list_len = server_list.len();
+    println!("scanning {server_list_len} servers");
+
+    let mut i: usize = 0;
+
+    while i + config.batch_size < server_list_len {
+        tx.send(scan_server_list(&server_list[i..i + config.batch_size], &config).await).await.unwrap();
+        i += config.batch_size;
+        println!("{i}/{server_list_len}");
+    }
+    
+    if i != server_list_len {
+        tx.send(scan_server_list(&server_list[i..i + (server_list_len - i)], &config).await).await.unwrap();
+        i += server_list_len - i;
+        println!("{i}/{server_list_len}");
+    }
+}
+
+async fn scan_server_list(server_list: &[SocketAddr], config: &Config) -> Vec<(SocketAddr, Option<ServerInfo>, Option<ServerJoinInfo>)> {
+    let futures = FuturesUnordered::new();
+    
+    for addr in server_list {
+        futures.push(async {
+            match timeout(config.timeout, scan_server(*addr, config.join_scan)).await {
+                Ok(result) => result,
+                Err(_) => (*addr, None, None)
+            }
+        });
+    }
+
+    return futures.collect().await
+}
+
+async fn scan_server(addr: SocketAddr, do_join_scan: bool) -> (SocketAddr, Option<ServerInfo>, Option<ServerJoinInfo>) {
+    let Some(server_info) = ping_scan(addr).await else {
+        return (addr, None, None)
     };
 
     if do_join_scan {
-        if server_info.protocol <= 0 { // we just have to guess here
-            if let Ok(server_join_info) = timeout(TIMEOUT, join_scan(addr, 754)).await {
-                tx.send((server_info, server_join_info)).await.unwrap();
-                return
-            };
-        } else if let Ok(server_join_info) = timeout(TIMEOUT, join_scan(addr, server_info.protocol)).await {
-            tx.send((server_info, server_join_info)).await.unwrap();
-            return
-        }
-        
+        let server_join_info = join_scan(addr, if server_info.protocol <= 0 { 754 } else { server_info.protocol }).await;
+        return (addr, Some(server_info), server_join_info)
     }
-    tx.send((server_info, None)).await.unwrap();
+
+    return (addr, Some(server_info), None)
 }
 
 async fn ping_scan(addr: SocketAddr) -> Option<ServerInfo> {
@@ -288,7 +338,7 @@ async fn ping_scan(addr: SocketAddr) -> Option<ServerInfo> {
             },
             _ => None
         },
-        motd: parse_motd(&json["description"])?,
+        motd: parse_motd(&json["description"]),
         favicon: match &json["favicon"] {
             Value::String(str) => Some(str.to_string()),
             _ => None,
