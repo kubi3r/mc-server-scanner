@@ -191,7 +191,9 @@ fn parse_args(args: Vec<String>) -> Config {
 
                 config.timeout = timeout.parse::<humantime::Duration>().expect("timeout is not a valid time").into()
             },
-            _ => ()
+            arg => {
+                panic!("unknown argument: {arg}")
+            }
         }
     }
 
