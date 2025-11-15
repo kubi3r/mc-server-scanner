@@ -1,24 +1,19 @@
 use std::process::Command;
 use std::env;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
+use tokio::select;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::{mpsc, mpsc::Sender};
 use tokio::net::TcpSocket;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 use tokio::fs::File;
 use tokio_postgres::{Client, NoTls};
 use serde_json::{Value};
-
-struct Config {
-    timeout: Duration,
-    batch_size: usize,
-    join_scan: bool,
-    rescan_mode: bool,
-}
 
 #[tokio::main]
 async fn main() {
@@ -26,22 +21,73 @@ async fn main() {
     let config = parse_args(args);
 
     let (client, connection) = tokio_postgres::connect("host=localhost user=postgres dbname=scanner", NoTls).await.unwrap();
+    let client = Arc::new(client);
+
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             eprintln!("connection error: {e}");
         }
     });
 
-    let servers: Vec<SocketAddr> = if config.rescan_mode {
-        get_servers_in_db(&client).await
-    } else {
-        read_masscan_output("masscan/masscan-output.txt").await
-    };
-
     let (tx, rx) = mpsc::channel(100);
 
-    tokio::spawn(batch_server_list(servers, tx, config));
-    collect_servers_to_db(&client, rx).await;
+    tokio::spawn(collect_servers_to_db(client.clone(), rx));
+
+    if config.full_scan_every.is_none() || config.rescan_every.is_none() {
+        let servers = if config.rescan_mode {
+            get_servers_in_db(&client).await
+        } else {
+            read_masscan_output("masscan/masscan-output.txt").await
+        };
+
+        batch_server_list(servers, &tx, &config).await;
+    } else {
+        let mut last_full_scan = SystemTime::now();
+        let mut last_rescan = SystemTime::now();
+
+        let full_scan_every = match config.full_scan_every {
+            Some(dur) => {
+                println!("scanning for new servers every {} hours", dur.as_secs() / 3600);
+                dur
+            },
+            None => Duration::MAX
+        };
+
+        let rescan_every = match config.rescan_every {
+            Some(dur) => {
+                println!("rescanning every {} hours", dur.as_secs() / 3600);
+                dur
+            },
+            None => Duration::MAX
+        };
+
+        loop {
+            let servers = select! {
+                _ = sleep(full_scan_every - last_full_scan.elapsed().unwrap()) => {
+                    println!("scanning for new servers now");
+                    last_full_scan = SystemTime::now();
+                    read_masscan_output("masscan/masscan-output.txt").await
+
+                }
+                _ = sleep(rescan_every - last_rescan.elapsed().unwrap()) => {
+                    println!("rescanning now");
+                    last_rescan = SystemTime::now();
+                    get_servers_in_db(&client).await
+                }
+            };
+
+            batch_server_list(servers, &tx, &config).await;
+        }
+    }
+}
+
+struct Config {
+    timeout: Duration,
+    batch_size: usize,
+    join_scan: bool,
+    rescan_mode: bool,
+    rescan_every: Option<Duration>,
+    full_scan_every: Option<Duration>,
 }
 
 fn parse_args(args: Vec<String>) -> Config {
@@ -50,6 +96,8 @@ fn parse_args(args: Vec<String>) -> Config {
         batch_size: 1000,
         join_scan: false,
         rescan_mode: false,
+        rescan_every: None,
+        full_scan_every: None,
     };
 
     let mut args_iter = args.iter().skip(1);
@@ -86,6 +134,24 @@ fn parse_args(args: Vec<String>) -> Config {
                 };
 
                 config.timeout = timeout.parse::<humantime::Duration>().expect("timeout is not a valid time").into()
+            },
+            "--rescan-every" => {
+                let time = args_iter.next();
+
+                let Some(time) = time else {
+                    panic!("time for '--rescan-every' is not specified")
+                };
+
+                config.rescan_every = Some(time.parse::<humantime::Duration>().expect("time for '--rescan-every' is not a valid time").into())
+            },
+            "--full-scan-every" => {
+                let time = args_iter.next();
+
+                let Some(time) = time else {
+                    panic!("time for '--full-scan-every' is not specified")
+                };
+
+                config.full_scan_every = Some(time.parse::<humantime::Duration>().expect("time for '--full-scan-every' is not a valid time").into())
             },
             arg => {
                 panic!("unknown argument: {arg}")
@@ -161,7 +227,7 @@ struct ServerJoinInfo {
     forge: Option<bool>
 }
 
-async fn collect_servers_to_db(client: &Client, mut rx: Receiver<Vec<(SocketAddr, Option<ServerInfo>, Option<ServerJoinInfo>)>>) {
+async fn collect_servers_to_db(client: Arc<Client>, mut rx: Receiver<Vec<(SocketAddr, Option<ServerInfo>, Option<ServerJoinInfo>)>>) {
     let insert_server = client.prepare(r"
         INSERT INTO servers (ip, port, version_name, protocol, players_max, players_online, online, motd, favicon, first_seen, last_seen, cracked, whitelist, forge)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
@@ -244,7 +310,7 @@ async fn collect_servers_to_db(client: &Client, mut rx: Receiver<Vec<(SocketAddr
     }
 }
 
-async fn batch_server_list(server_list: Vec<SocketAddr>, tx: Sender<Vec<(SocketAddr, Option<ServerInfo>, Option<ServerJoinInfo>)>>, config: Config) {
+async fn batch_server_list(server_list: Vec<SocketAddr>, tx: &Sender<Vec<(SocketAddr, Option<ServerInfo>, Option<ServerJoinInfo>)>>, config: &Config) {
     let server_list_len = server_list.len();
     println!("scanning {server_list_len} servers");
 
