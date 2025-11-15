@@ -34,6 +34,13 @@ async fn main() {
     tokio::spawn(collect_servers_to_db(client.clone(), rx));
 
     if config.full_scan_every.is_none() || config.rescan_every.is_none() {
+        if config.masscan {
+            println!("scanning for open ports with masscan");
+            Command::new("masscan")
+                .args(["-c", "masscan/masscan.conf"])
+                .status().expect("failed to run masscan");
+        }
+
         let servers = if config.rescan_mode {
             get_servers_in_db(&client).await
         } else {
@@ -65,6 +72,13 @@ async fn main() {
             let servers = select! {
                 _ = sleep(full_scan_every - last_full_scan.elapsed().unwrap()) => {
                     println!("scanning for new servers now");
+                    if config.masscan {
+                        println!("scanning for open ports with masscan");
+                        Command::new("masscan")
+                            .args(["-c", "masscan/masscan.conf"])
+                            .status().expect("failed to run masscan");
+                    }
+
                     last_full_scan = SystemTime::now();
                     read_masscan_output("masscan/masscan-output.txt").await
 
@@ -88,6 +102,7 @@ struct Config {
     rescan_mode: bool,
     rescan_every: Option<Duration>,
     full_scan_every: Option<Duration>,
+    masscan: bool,
 }
 
 fn parse_args(args: Vec<String>) -> Config {
@@ -98,6 +113,7 @@ fn parse_args(args: Vec<String>) -> Config {
         rescan_mode: false,
         rescan_every: None,
         full_scan_every: None,
+        masscan: false,
     };
 
     let mut args_iter = args.iter().skip(1);
@@ -105,10 +121,7 @@ fn parse_args(args: Vec<String>) -> Config {
     while let Some(arg) = args_iter.next() {
         match arg.as_str() {
             "-m" | "--masscan" => {
-                println!("scanning for open ports with masscan");
-                Command::new("masscan")
-                    .args(["-c", "masscan/masscan.conf"])
-                    .status().expect("failed to run masscan");
+                config.masscan = true;
             },
             "-j" | "--join" => {
                 config.join_scan = true;
