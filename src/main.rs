@@ -42,6 +42,7 @@ async fn main() {
         }
 
         let servers = if config.rescan_mode {
+            config.join_scan = false;
             get_servers_in_db(&client).await
         } else {
             config.join_scan = true;
@@ -71,6 +72,13 @@ async fn main() {
 
         loop {
             let servers = select! {
+                _ = sleep(rescan_every - last_rescan.elapsed().unwrap()) => {
+                    println!("rescanning now");
+                    last_rescan = SystemTime::now();
+                    
+                    config.join_scan = false;
+                    get_servers_in_db(&client).await
+                },
                 _ = sleep(full_scan_every - last_full_scan.elapsed().unwrap()) => {
                     println!("scanning for new servers now");
                     last_full_scan = SystemTime::now();
@@ -84,13 +92,7 @@ async fn main() {
 
                     config.join_scan = true;
                     read_masscan_output("masscan/masscan-output.txt").await
-                }
-                _ = sleep(rescan_every - last_rescan.elapsed().unwrap()) => {
-                    println!("rescanning now");
-                    last_rescan = SystemTime::now();
-                    
-                    get_servers_in_db(&client).await
-                }
+                },
             };
 
             batch_server_list(servers, &tx, &config).await;
@@ -125,9 +127,6 @@ fn parse_args(args: Vec<String>) -> Config {
         match arg.as_str() {
             "-m" | "--masscan" => {
                 config.masscan = true;
-            },
-            "-j" | "--join" => {
-                config.join_scan = true;
             },
             "-r" | "--rescan" => {
                 println!("rescanning servers in db");
