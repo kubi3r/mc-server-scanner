@@ -18,7 +18,7 @@ use serde_json::{Value};
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = env::args().collect();
-    let config = parse_args(args);
+    let mut config = parse_args(args);
 
     let (client, connection) = tokio_postgres::connect("host=localhost user=postgres dbname=scanner", NoTls).await.unwrap();
     let client = Arc::new(client);
@@ -44,6 +44,7 @@ async fn main() {
         let servers = if config.rescan_mode {
             get_servers_in_db(&client).await
         } else {
+            config.join_scan = true;
             read_masscan_output("masscan/masscan-output.txt").await
         };
 
@@ -72,6 +73,8 @@ async fn main() {
             let servers = select! {
                 _ = sleep(full_scan_every - last_full_scan.elapsed().unwrap()) => {
                     println!("scanning for new servers now");
+                    last_full_scan = SystemTime::now();
+
                     if config.masscan {
                         println!("scanning for open ports with masscan");
                         Command::new("masscan")
@@ -79,13 +82,13 @@ async fn main() {
                             .status().expect("failed to run masscan");
                     }
 
-                    last_full_scan = SystemTime::now();
+                    config.join_scan = true;
                     read_masscan_output("masscan/masscan-output.txt").await
-
                 }
                 _ = sleep(rescan_every - last_rescan.elapsed().unwrap()) => {
                     println!("rescanning now");
                     last_rescan = SystemTime::now();
+                    
                     get_servers_in_db(&client).await
                 }
             };
