@@ -28,3 +28,13 @@ CREATE TABLE players (
         REFERENCES servers(ip, port)
         ON DELETE CASCADE
 );
+
+CREATE TABLE stats (
+    timestamp bigint,
+    server_count bigint,
+    online_count bigint,
+    cracked_count bigint,
+    total_player_count bigint,
+    whitelist_count bigint,
+    forge_count bigint
+);

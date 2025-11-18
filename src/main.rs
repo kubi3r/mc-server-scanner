@@ -50,6 +50,7 @@ async fn main() {
         };
 
         batch_server_list(servers, &tx, &config).await;
+        update_stats(&client).await;
     } else {
         let mut last_full_scan = SystemTime::now();
         let mut last_rescan = SystemTime::now();
@@ -96,6 +97,7 @@ async fn main() {
             };
 
             batch_server_list(servers, &tx, &config).await;
+            update_stats(&client).await;
         }
     }
 }
@@ -664,4 +666,29 @@ fn parse_motd(component: &Value) -> Option<String> {
         },
         _ => None,
     }
+}
+
+async fn update_stats(client: &Client) {
+    let stats = client.prepare(r"
+        INSERT INTO stats (timestamp, server_count, online_count, cracked_count, total_player_count, whitelist_count, forge_count)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+    ").await.unwrap();
+
+    let timestamp = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis()).unwrap();
+    let server_count: i64 = client.query_one("SELECT COUNT(ip) FROM servers", &[]).await.unwrap().get(0);
+    let online_count: i64 = client.query_one("SELECT COUNT(ip) FROM servers WHERE online", &[]).await.unwrap().get(0);
+    let cracked_count: i64 = client.query_one("SELECT COUNT(ip) FROM servers WHERE cracked", &[]).await.unwrap().get(0);
+    let total_player_count: i64 = client.query_one("SELECT COUNT(name) FROM players", &[]).await.unwrap().get(0);
+    let whitelist_count: i64 = client.query_one("SELECT COUNT(ip) FROM servers WHERE whitelist", &[]).await.unwrap().get(0);
+    let forge_count: i64 = client.query_one("SELECT COUNT(ip) FROM servers WHERE forge", &[]).await.unwrap().get(0);
+
+    client.execute(&stats, &[
+        &timestamp,
+        &server_count,
+        &online_count,
+        &cracked_count,
+        &total_player_count,
+        &whitelist_count,
+        &forge_count,
+    ]).await.unwrap();
 }
