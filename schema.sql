@@ -13,6 +13,7 @@ CREATE TABLE servers (
     favicon text,
     first_seen bigint NOT NULL,
     last_seen bigint NOT NULL,
+    country text,
     PRIMARY KEY (ip, port)
 );
 

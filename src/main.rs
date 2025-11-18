@@ -246,8 +246,8 @@ struct ServerJoinInfo {
 
 async fn collect_servers_to_db(client: Arc<Client>, mut rx: Receiver<Vec<(SocketAddr, Option<ServerInfo>, Option<ServerJoinInfo>)>>) {
     let insert_server = client.prepare(r"
-        INSERT INTO servers (ip, port, version_name, protocol, players_max, players_online, online, motd, favicon, first_seen, last_seen, cracked, whitelist, forge)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        INSERT INTO servers (ip, port, version_name, protocol, players_max, players_online, online, motd, favicon, first_seen, last_seen, cracked, whitelist, forge, country)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
         ON CONFLICT (ip, port)
         DO UPDATE SET
             version_name = EXCLUDED.version_name,
@@ -260,7 +260,8 @@ async fn collect_servers_to_db(client: Arc<Client>, mut rx: Receiver<Vec<(Socket
             last_seen = EXCLUDED.last_seen,
             cracked = EXCLUDED.cracked,
             whitelist = EXCLUDED.whitelist,
-            forge = EXCLUDED.forge
+            forge = EXCLUDED.forge,
+            country = EXCLUDED.country
     ").await.unwrap();
 
     let insert_player = client.prepare(r"
@@ -279,6 +280,8 @@ async fn collect_servers_to_db(client: Arc<Client>, mut rx: Receiver<Vec<(Socket
             ip = $1 AND port = $2 
     ").await.unwrap();
 
+    let maxmind_reader = maxminddb::Reader::open_readfile("GeoLite2-Country.mmdb").unwrap();
+
     while let Some(servers) = rx.recv().await {
         for server in servers {
             let (addr, server_info, server_join_info) = server;
@@ -295,6 +298,16 @@ async fn collect_servers_to_db(client: Arc<Client>, mut rx: Receiver<Vec<(Socket
                 forge = server_join_info.forge;
             }
 
+            let country_code = match maxmind_reader.lookup::<maxminddb::geoip2::Country>(addr.ip()).unwrap() {
+                Some(country) => match country.country {
+                    Some(country) => {
+                        country.iso_code
+                    },
+                    None => None
+                },
+                None => None
+            };
+
             if let Err(e) = client.execute(&insert_server, &[
                 &server_info.ip,
                 &server_info.port,
@@ -310,6 +323,7 @@ async fn collect_servers_to_db(client: Arc<Client>, mut rx: Receiver<Vec<(Socket
                 &cracked,
                 &whitelist,
                 &forge,
+                &country_code
             ]).await {
                 eprintln!("error adding server to db: {e}");
             }
