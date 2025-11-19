@@ -1,19 +1,23 @@
 use std::process::Command;
 use std::env;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use tokio::select;
-use tokio::sync::mpsc::Receiver;
 use tokio::sync::{mpsc, mpsc::Sender};
 use tokio::net::TcpSocket;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::time::{sleep, timeout};
 use tokio::fs::File;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::NoTls;
 use serde_json::{Value};
+
+use util::{Config, Player, ServerInfo, ServerJoinInfo};
+
+mod db;
+mod util;
 
 #[tokio::main]
 async fn main() {
@@ -31,7 +35,7 @@ async fn main() {
 
     let (tx, rx) = mpsc::channel(100);
 
-    tokio::spawn(collect_servers_to_db(client.clone(), rx));
+    tokio::spawn(db::collect_servers_to_db(client.clone(), rx));
 
     if config.full_scan_every.is_none() || config.rescan_every.is_none() {
         if config.masscan {
@@ -43,14 +47,14 @@ async fn main() {
 
         let servers = if config.rescan_mode {
             config.join_scan = false;
-            get_servers_in_db(&client).await
+            db::get_servers(&client).await
         } else {
             config.join_scan = true;
             read_masscan_output("masscan/masscan-output.txt").await
         };
 
         batch_server_list(servers, &tx, &config).await;
-        update_stats(&client).await;
+        db::update_stats(&client).await;
     } else {
         let mut last_full_scan = SystemTime::now();
         let mut last_rescan = SystemTime::now();
@@ -78,7 +82,7 @@ async fn main() {
                     last_rescan = SystemTime::now();
                     
                     config.join_scan = false;
-                    get_servers_in_db(&client).await
+                    db::get_servers(&client).await
                 },
                 _ = sleep(full_scan_every - last_full_scan.elapsed().unwrap()) => {
                     println!("scanning for new servers now");
@@ -97,19 +101,9 @@ async fn main() {
             };
 
             batch_server_list(servers, &tx, &config).await;
-            update_stats(&client).await;
+            db::update_stats(&client).await;
         }
     }
-}
-
-struct Config {
-    timeout: Duration,
-    batch_size: usize,
-    join_scan: bool,
-    rescan_mode: bool,
-    rescan_every: Option<Duration>,
-    full_scan_every: Option<Duration>,
-    masscan: bool,
 }
 
 fn parse_args(args: Vec<String>) -> Config {
@@ -205,142 +199,6 @@ async fn read_masscan_output(file_path: &str) -> Vec<SocketAddr> {
     servers
 }
 
-async fn get_servers_in_db(client: &Client) -> Vec<SocketAddr> {
-    let mut servers = Vec::new();
-
-    let server_rows = client.query("SELECT ip, port FROM servers", &[]).await.unwrap();
-    for row in server_rows {
-        let ip: IpAddr = row.get("ip");
-        let port: i32 = row.get("port");
-
-        servers.push(SocketAddr::new(ip, port.try_into().unwrap()))
-    }
-
-    servers
-}
-
-struct ServerInfo {
-    ip: IpAddr,
-    port: i32,
-    version_name: String,
-    protocol: i32,
-    players_max: i32,
-    players_online: i32,
-    player_sample: Option<Vec<Player>>,
-    motd: Option<String>,
-    favicon: Option<String>,
-    timestamp: i64
-}
-
-struct Player {
-    name: String,
-    uuid: String,
-    timestamp: i64,
-}
-
-struct ServerJoinInfo {
-    cracked: Option<bool>,
-    whitelist: Option<bool>,
-    forge: Option<bool>
-}
-
-async fn collect_servers_to_db(client: Arc<Client>, mut rx: Receiver<Vec<(SocketAddr, Option<ServerInfo>, Option<ServerJoinInfo>)>>) {
-    let insert_server = client.prepare(r"
-        INSERT INTO servers (ip, port, version_name, protocol, players_max, players_online, online, motd, favicon, first_seen, last_seen, cracked, whitelist, forge, country)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-        ON CONFLICT (ip, port)
-        DO UPDATE SET
-            version_name = EXCLUDED.version_name,
-            protocol = EXCLUDED.protocol,
-            players_max = EXCLUDED.players_max,
-            players_online = EXCLUDED.players_online,
-            online = EXCLUDED.online,
-            motd = EXCLUDED.motd,
-            favicon = EXCLUDED.favicon,
-            last_seen = EXCLUDED.last_seen,
-            cracked = EXCLUDED.cracked,
-            whitelist = EXCLUDED.whitelist,
-            forge = EXCLUDED.forge,
-            country = EXCLUDED.country
-    ").await.unwrap();
-
-    let insert_player = client.prepare(r"
-        INSERT INTO players (ip, port, name, uuid, first_seen, last_seen)
-        VALUES ($1, $2, $3, $4, $5, $6)
-        ON CONFLICT (ip, port, name)
-        DO UPDATE SET
-            last_seen = EXCLUDED.last_seen
-    ").await.unwrap();
-
-    let set_offline = client.prepare(r"
-        UPDATE servers
-        SET
-            online = false
-        WHERE
-            ip = $1 AND port = $2 
-    ").await.unwrap();
-
-    let maxmind_reader = maxminddb::Reader::open_readfile("GeoLite2-Country.mmdb").unwrap();
-
-    while let Some(servers) = rx.recv().await {
-        for server in servers {
-            let (addr, server_info, server_join_info) = server;
-
-            let Some(server_info) = server_info else {
-                client.execute(&set_offline, &[&addr.ip(), &(addr.port() as i32)]).await.unwrap();
-                continue
-            };
-
-            let (mut cracked, mut whitelist, mut forge) = (None, None, None);
-            if let Some(server_join_info) = server_join_info {
-                cracked = server_join_info.cracked;
-                whitelist = server_join_info.whitelist;
-                forge = server_join_info.forge;
-            }
-
-            let country_code = match maxmind_reader.lookup::<maxminddb::geoip2::Country>(addr.ip()).unwrap() {
-                Some(country) => match country.country {
-                    Some(country) => {
-                        country.iso_code
-                    },
-                    None => None
-                },
-                None => None
-            };
-
-            if let Err(e) = client.execute(&insert_server, &[
-                &server_info.ip,
-                &server_info.port,
-                &server_info.version_name,
-                &server_info.protocol,
-                &server_info.players_max,
-                &server_info.players_online,
-                &true,
-                &server_info.motd,
-                &server_info.favicon,
-                &server_info.timestamp,
-                &server_info.timestamp,
-                &cracked,
-                &whitelist,
-                &forge,
-                &country_code
-            ]).await {
-                eprintln!("error adding server to db: {e}");
-            }
-
-            if let Some(sample) = server_info.player_sample {
-                for player in sample {
-                    if player.name != "Anonymous Player" {
-                        if let Err(e) = client.execute(&insert_player, &[&server_info.ip, &server_info.port, &player.name, &player.uuid, &player.timestamp, &player.timestamp]).await {
-                            eprintln!("error adding player to db: {e}");
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 async fn batch_server_list(server_list: Vec<SocketAddr>, tx: &Sender<Vec<(SocketAddr, Option<ServerInfo>, Option<ServerJoinInfo>)>>, config: &Config) {
     let server_list_len = server_list.len();
     println!("scanning {server_list_len} servers");
@@ -348,22 +206,22 @@ async fn batch_server_list(server_list: Vec<SocketAddr>, tx: &Sender<Vec<(Socket
     let mut i: usize = 0;
 
     while i + config.batch_size < server_list_len {
-        tx.send(scan_server_list(&server_list[i..i + config.batch_size], &config).await).await.unwrap();
+        tx.send(scan_batch(&server_list[i..i + config.batch_size], &config).await).await.unwrap();
         i += config.batch_size;
         println!("{i}/{server_list_len}");
     }
     
     if i != server_list_len {
-        tx.send(scan_server_list(&server_list[i..i + (server_list_len - i)], &config).await).await.unwrap();
+        tx.send(scan_batch(&server_list[i..i + (server_list_len - i)], &config).await).await.unwrap();
         i += server_list_len - i;
         println!("{i}/{server_list_len}");
     }
 }
 
-async fn scan_server_list(server_list: &[SocketAddr], config: &Config) -> Vec<(SocketAddr, Option<ServerInfo>, Option<ServerJoinInfo>)> {
+async fn scan_batch(batch: &[SocketAddr], config: &Config) -> Vec<(SocketAddr, Option<ServerInfo>, Option<ServerJoinInfo>)> {
     let futures = FuturesUnordered::new();
     
-    for addr in server_list {
+    for addr in batch {
         futures.push(async {
             match timeout(config.timeout, scan_server(*addr, config.join_scan)).await {
                 Ok(result) => result,
@@ -392,18 +250,18 @@ async fn ping_scan(addr: SocketAddr) -> Option<ServerInfo> {
     let socket = TcpSocket::new_v4().ok()?;
     let mut stream = socket.connect(addr).await.ok()?;
 
-    stream.write_all(&prefix_len(&form_handshake(1, 754, addr))).await.ok()?;
+    stream.write_all(&util::prefix_len(&util::form_handshake(1, 754, addr))).await.ok()?;
     stream.write_all(&[0x01, 0x00]).await.ok()?;
 
     let mut reader = BufReader::new(stream);
-    read_varint(&mut reader).await?;
+    util::read_varint(&mut reader).await?;
 
-    let packet_id = read_varint(&mut reader).await?;
+    let packet_id = util::read_varint(&mut reader).await?;
     if packet_id != 0x00 {
         return None
     }
 
-    let json_len = read_varint(&mut reader).await?;
+    let json_len = util::read_varint(&mut reader).await?;
     if json_len > 100000 {
         return None
     }
@@ -456,7 +314,7 @@ async fn ping_scan(addr: SocketAddr) -> Option<ServerInfo> {
             },
             _ => None
         },
-        motd: parse_motd(&json["description"]),
+        motd: util::parse_motd(&json["description"]),
         favicon: match &json["favicon"] {
             Value::String(str) => Some(str.to_string()),
             _ => None,
@@ -469,50 +327,50 @@ async fn join_scan(addr: SocketAddr, protocol: i32) -> Option<ServerJoinInfo> {
     let socket = TcpSocket::new_v4().ok()?;
     let mut stream = socket.connect(addr).await.ok()?;
 
-    stream.write_all(&prefix_len(&form_handshake(2, protocol, addr))).await.ok()?;
+    stream.write_all(&util::prefix_len(&util::form_handshake(2, protocol, addr))).await.ok()?;
     
     let username = b"scanner";
     
     let login_start_fields = match protocol {
         protocol if protocol <= 758 => {
-            &prefix_len(username)
+            &util::prefix_len(username)
         },
         759 => {
             &[
-                &prefix_len(username)[..],
+                &util::prefix_len(username)[..],
                 &[0x00]
             ].concat()
         },
         760 => {
             &[
-                &prefix_len(username)[..],
+                &util::prefix_len(username)[..],
                 &[0x00, 0x00]
             ].concat()
         },
         protocol if protocol <= 763 => {
             &[
-                &prefix_len(username)[..],
+                &util::prefix_len(username)[..],
                 &[0x00]
             ].concat()
         },
         _ => {
             &[
-                &prefix_len(username)[..],
+                &util::prefix_len(username)[..],
                 &0xe0ce739bab603be2b9dfd45dcee616a2_u128.to_be_bytes()
             ].concat()
         }
     };
 
-    stream.write_all(&prefix_len(&[&[0x00], &login_start_fields[..]].concat())).await.ok()?;
+    stream.write_all(&util::prefix_len(&[&[0x00], &login_start_fields[..]].concat())).await.ok()?;
 
     let mut reader = BufReader::new(stream);
 
-    read_varint(&mut reader).await?;
-    let packet_id = read_varint(&mut reader).await?;
+    util::read_varint(&mut reader).await?;
+    let packet_id = util::read_varint(&mut reader).await?;
 
     match packet_id {
         0x00 => {
-            let reason_len = read_varint(&mut reader).await?;
+            let reason_len = util::read_varint(&mut reader).await?;
 
             let mut buf = vec![0u8; reason_len.try_into().unwrap()];
             reader.read_exact(&mut buf).await.ok()?;
@@ -560,149 +418,4 @@ async fn join_scan(addr: SocketAddr, protocol: i32) -> Option<ServerJoinInfo> {
         },
         _ => None
     }
-}
-
-fn form_handshake(intent: u8, protocol: i32, addr: SocketAddr) -> Vec<u8> {
-    let ip = addr.ip().to_string();
-    let port = addr.port();
-
-    [
-        &[0x00],
-        write_varint(protocol).as_slice(),
-        write_varint(ip.len().try_into().unwrap()).as_slice(),
-        ip.as_bytes(),
-        &port.to_be_bytes(),
-        &[intent]
-    ].concat()
-}
-
-fn prefix_len(bytes: &[u8]) -> Vec<u8> {
-    [
-        &write_varint(bytes.len().try_into().unwrap()),
-        bytes
-    ].concat()
-}
-
-fn write_varint(num: i32) -> Vec<u8> {
-    let mut num = num as u32;
-    let mut output = Vec::new();
-
-    loop {
-        if num & !0x7F == 0 {
-            output.push(num as u8);
-            return output
-        }
-
-        output.push((num as u8) | 0x80);
-        num >>= 7;
-    }
-}
-
-async fn read_varint<R: AsyncRead + Unpin>(reader: &mut BufReader<R>) -> Option<i32> {
-    let mut output: u32 = 0;
-    let mut position = 0;
-
-    loop {
-        let mut byte = [0; 1];
-        reader.read_exact(&mut byte).await.ok()?;
-        let byte = byte[0];
-
-        output |= (byte as u32 & 0x7F) << position;
-
-        if byte & 0x80 == 0 {
-            break
-        }
-
-        position += 7;
-
-        if position >= 32 {
-            return None
-        }
-    }
-    
-    Some(output as i32)
-}
-
-fn parse_motd(component: &Value) -> Option<String> {
-    match component {
-        Value::Object(obj) => {
-            let mut output = String::new();
-
-            if let Some(text) = obj.get("text")
-                && let Some(str) = parse_motd(text) {
-                    output.push_str(&str);
-                }
-
-            if let Some(extra) = obj.get("extra")
-                && let Some(extra) = parse_motd(extra) {
-                    output.push_str(&extra);
-                }
-
-            if !output.is_empty() {
-                return Some(output)
-            }
-
-            None
-        },
-        Value::Array(arr) => {
-            let mut output = String::new();
-            for value in arr {
-                if let Some(str) = parse_motd(value) {
-                    output.push_str(&str);
-                }
-            }
-
-            if !output.is_empty() {
-                return Some(output)
-            }
-
-            None
-        }
-        Value::String(str) => {
-            let mut output = String::new();
-
-            let mut ignore_next = false;
-            for char in str.chars() {
-                if char == '§' {
-                    ignore_next = true;
-                } else if ignore_next {
-                    ignore_next = false;
-                } else {
-                    output.push(char);
-                }
-            }
-
-            if !output.is_empty() {
-                return Some(output)
-            }
-
-            None
-        },
-        _ => None,
-    }
-}
-
-async fn update_stats(client: &Client) {
-    let stats = client.prepare(r"
-        INSERT INTO stats (timestamp, server_count, online_count, cracked_count, total_player_count, whitelist_count, forge_count)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-    ").await.unwrap();
-
-    let timestamp = i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis()).unwrap();
-    let server_count: i64 = client.query_one("SELECT COUNT(ip) FROM servers", &[]).await.unwrap().get(0);
-    let online_count: i64 = client.query_one("SELECT COUNT(ip) FROM servers WHERE online", &[]).await.unwrap().get(0);
-    let cracked_count: i64 = client.query_one("SELECT COUNT(ip) FROM servers WHERE cracked", &[]).await.unwrap().get(0);
-    let total_player_count: i64 = client.query_one("SELECT COUNT(name) FROM players", &[]).await.unwrap().get(0);
-    let whitelist_count: i64 = client.query_one("SELECT COUNT(ip) FROM servers WHERE whitelist", &[]).await.unwrap().get(0);
-    let forge_count: i64 = client.query_one("SELECT COUNT(ip) FROM servers WHERE forge", &[]).await.unwrap().get(0);
-
-    client.execute(&stats, &[
-        &timestamp,
-        &server_count,
-        &online_count,
-        &cracked_count,
-        &total_player_count,
-        &whitelist_count,
-        &forge_count,
-    ]).await.unwrap();
 }
